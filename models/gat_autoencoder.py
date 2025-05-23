@@ -11,19 +11,36 @@ class GATEncoder(nn.Module):
     def __init__(self, in_channels, hidden_channels, heads=1):
         super(GATEncoder, self).__init__()
         self.conv1 = GATConv(in_channels, hidden_channels, heads=heads)
-        self.conv2 = GATConv(hidden_channels * heads, in_channels, heads=1)
+        self.conv2 = GATConv(hidden_channels*heads, int(hidden_channels/2), heads=1)
+        self.conv3 = GATConv(int(hidden_channels/2), in_channels, heads=heads)
+
+        self.bn1 = nn.BatchNorm1d(num_features=hidden_channels)
+        self.bn2 = nn.BatchNorm1d(num_features=int(hidden_channels/2))
+
+        self.activation = nn.LeakyReLU()
 
         self.hidden_channels = hidden_channels
 
     def forward(self, x, edge_index):
-        x = torch.relu(self.conv1(x, edge_index))
-        return self.conv2(x, edge_index)
+        x = self.conv1(x, edge_index)
+        x = self.bn1(x)
+        x = self.activation(x)
+
+        x = self.conv2(x, edge_index)
+        x = self.bn2(x)
+        z = self.activation(x)
+
+        x = self.conv3(z, edge_index)
+        return x
 
 class GATAnomalyDetector(nn.Module):
     def __init__(self, encoder):
         super(GATAnomalyDetector, self).__init__()
         self.encoder = encoder
-        self.lin = nn.Linear(encoder.hidden_channels, 1)
+
+        self.activation = nn.LeakyReLU()
+        self.dropout = nn.Dropout(0.4)
+        self.lin = nn.Linear(int(encoder.hidden_channels/2), 1)
 
     def forward(self, x, edge_index):
         x_hat = self.encoder(x, edge_index)
@@ -36,4 +53,40 @@ class GATAnomalyDetector(nn.Module):
         batch = data.batch
 
         x = self.encoder.conv1(x, edge_index)
-        return self.lin(global_mean_pool(x, batch))
+        x = self.encoder.bn1(x)
+        x = self.encoder.activation(x)
+
+        x = self.encoder.conv2(x, edge_index)
+        x = self.encoder.bn2(x)
+        x = self.encoder.activation(x)
+
+        x = global_mean_pool(x, batch)
+
+        x = self.dropout(x)
+        return self.lin(x)
+
+class GATEncoder2(nn.Module):
+    def __init__(self, in_channels, hidden_channels, heads=1):
+        super(GATEncoder2, self).__init__()
+        self.conv1 = GATConv(in_channels, hidden_channels, heads=heads)
+        self.conv2 = GATConv(hidden_channels * heads, hidden_channels, heads=1)
+
+        self.bn = nn.BatchNorm1d(num_features=hidden_channels)
+        self.activation = nn.LeakyReLU()
+        self.dropout = nn.Dropout(0.4)
+
+        self.lin = nn.Linear(hidden_channels, 1)
+
+    def forward(self, data):
+        x = data.x
+        edge_index = data.edge_index
+        batch = data.batch
+
+        x = self.conv1(x, edge_index)
+        x = self.bn(x)
+        x = self.activation(x)
+
+        x = self.conv2(x, edge_index)
+        x = global_mean_pool(x, batch)
+        x = self.dropout(x)
+        return self.lin(x)

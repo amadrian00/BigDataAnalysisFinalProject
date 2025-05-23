@@ -24,7 +24,10 @@ def train(model, loader, optimizer, weight, device='cpu'):
         data = data.to(device)
         optimizer.zero_grad()
 
-        out = model.ft(data)
+        try:
+            out = model.ft(data)  # logits shape: [batch_size]
+        except:
+            out = model(data)
 
         loss = torch.nn.functional.binary_cross_entropy_with_logits(
             out,
@@ -46,7 +49,10 @@ def test(model, loader, device='cpu'):
     with torch.no_grad():
         for data in loader:
             data = data.to(device)
-            out = model.ft(data)  # logits shape: [batch_size]
+            try:
+                out = model.ft(data)  # logits shape: [batch_size]
+            except:
+                out = model(data)
 
             prob = torch.sigmoid(out)  # No squeeze
             pred = (prob >= 0.5).long()

@@ -5,9 +5,9 @@ from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
 from sklearn.model_selection import StratifiedKFold
 
-from models.gcn_autoencoder import GCNEncoder, GCNAnomalyDetector
-from models.gat_autoencoder import GATEncoder, GATAnomalyDetector
-from models.chebnet_autoencoder import ChebEncoder, ChebAnomalyDetector
+from models.gcn_autoencoder import GCNEncoder, GCNAnomalyDetector, GCNEncoder2
+from models.gat_autoencoder import GATEncoder, GATAnomalyDetector, GATEncoder2
+from models.chebnet_autoencoder import ChebEncoder, ChebAnomalyDetector, ChebEncoder2
 
 from train_test import  pretrain, train, test, print_summary_table, compare_models
 
@@ -26,7 +26,7 @@ labels = data['label']  # Shape: (n_samples,)
 subjects = data['subject']  # Shape: (n_samples,)
 
 # Function to convert an FC matrix into a graph with edge thresholding
-def create_graph(adj_matrix, th=0.5):
+def create_graph(adj_matrix, th):
     # Apply absolute thresholding and exclude the diagonal
     mask = np.triu(np.abs(adj_matrix) >= th, k=1)
     row, col = np.where(mask)
@@ -36,11 +36,11 @@ def create_graph(adj_matrix, th=0.5):
 
     # Dummy node features (identity matrix)
     x = torch.eye(adj_matrix.shape[0], dtype=torch.float)
-
+    x = torch.tensor(adj_matrix, dtype=torch.float)
     return Data(x=x, edge_index=edge_index, edge_attr=edge_attr)
 
 # Build list of graphs
-graphs = [create_graph(fc_matrices[i], th=0.25) for i in range(len(fc_matrices))]
+graphs = [create_graph(fc_matrices[i], th=0.5) for i in range(len(fc_matrices))]
 for i, graph in enumerate(graphs):
     graph.y = torch.tensor([(labels[i] + 1) // 2], dtype=torch.long)
     graph.subject = subjects[i]
@@ -53,9 +53,12 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 input_dim = graphs[0].x.shape[1]
 hidden_dim = 64
 epochs = 100
-batch_size = 64
 
-results = {'GCN': [], 'GAT': [], 'Cheb': []}
+batch_size = 64
+lr = 1e-3
+wd = 1e-5
+
+results = {'GCN': [], 'GAT': [], 'Cheb': [], 'GCN2': [], 'GAT2': [], 'Cheb2': []}
 
 for repeat, s in enumerate(seeds):
     print(f"Repeat {repeat+1}/{len(seeds)}")
@@ -83,21 +86,41 @@ for repeat, s in enumerate(seeds):
         train_loader = DataLoader(train_graphs, batch_size=batch_size, shuffle=True)
         test_loader = DataLoader(test_graphs, batch_size=len(test_graphs))
 
-        for model_name, ModelClass, AEClass in zip(['GCN', 'GAT', 'Cheb'], [GCNEncoder, GATEncoder, ChebEncoder],
-                                                   [GCNAnomalyDetector, GATAnomalyDetector, ChebAnomalyDetector]):
-            encoder = ModelClass(in_channels=input_dim, hidden_channels=hidden_dim).to(device)
-            model = AEClass(encoder=encoder).to(device)
-            optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+        for model_name, ModelClass, AEClass in zip(['GCN', 'GAT', 'Cheb', 'GCN2', 'GAT2', 'Cheb2'],
+                                                             [GCNEncoder, GATEncoder, ChebEncoder, GCNEncoder2, GATEncoder2, ChebEncoder2],
+                                                   [GCNAnomalyDetector, GATAnomalyDetector, ChebAnomalyDetector, None, None, None]):
+            baseline = model_name[-1]  == '2'
+            if baseline:
+                model = ModelClass(in_channels=input_dim, hidden_channels=hidden_dim).to(device)
+            else:
+                encoder = ModelClass(in_channels=input_dim, hidden_channels=hidden_dim).to(device)
+                model = AEClass(encoder=encoder).to(device)
 
-            for epoch in range(epochs):
-                train_loss = pretrain(model, train_loader, optimizer, device=device)
+            optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=wd)
 
-            for epoch in range(int(epochs/2)):
-                for param in model.encoder.conv1.parameters():
-                    param.requires_grad = False
+            if not baseline:
+                for epoch in range(epochs):
+                    train_loss = pretrain(model, train_loader, optimizer, device=device)
 
-                optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-3)
-                train_loss = train(model, train_loader, optimizer, weight, device=device)
+                for epoch in range(epochs):
+                    for param in model.encoder.conv1.parameters():
+                        param.requires_grad = False
+                    for param in model.encoder.bn1.parameters():
+                        param.requires_grad = False
+
+                    optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=lr, weight_decay=wd)
+                    train_loss = train(model, train_loader, optimizer, weight, device=device)
+
+                for epoch in range(10):
+                    for param in model.parameters():
+                        param.requires_grad = True
+
+                    optimizer = torch.optim.Adam(model.parameters(), lr=1e-5, weight_decay=wd)
+                    train_loss = train(model, train_loader, optimizer, weight, device=device)
+
+            else:
+                for epoch in range(epochs):
+                    train_loss = train(model, train_loader, optimizer, weight, device=device)
 
             res  = test(model, test_loader, device=device)
             results[model_name].append(res)
@@ -109,6 +132,6 @@ np.save('resultsGAT.npy', results['GAT'])
 np.save('resultsCheb.npy', results['Cheb'])
 print_summary_table(results)
 
-compare_models(results['GCN'], results['GAT'], label_a="GCN", label_b="GAT")
-compare_models(results['GCN'], results['Cheb'], label_a="GCN", label_b="Cheb")
-compare_models(results['GAT'], results['Cheb'], label_a="GAT", label_b="Cheb")
+compare_models(results['GCN'], results['GCN2'], label_a="GCN", label_b="GCN2")
+compare_models(results['GAT'], results['GAT2'], label_a="GAT", label_b="GAT2")
+compare_models(results['Cheb'], results['Cheb2'], label_a="Cheb", label_b="Cheb2")
