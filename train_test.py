@@ -1,23 +1,10 @@
 import torch
 import numpy as np
 from scipy.stats import ttest_rel, tstd
-from sklearn.metrics import accuracy_score, f1_score, roc_auc_score, confusion_matrix
+from torch_geometric.utils.dropout import dropout_edge
+from sklearn.metrics import accuracy_score, f1_score, confusion_matrix
 
-def pretrain(model, loader, optimizer, device='cpu'):
-    model.train()
-    total_loss = 0
-    for data in loader:
-        data = data.to(device)
-        optimizer.zero_grad()
-
-        out, loss = model(data.x, data.edge_index)
-
-        loss.backward()
-        optimizer.step()
-        total_loss += loss.item()
-    return total_loss / len(loader)
-
-def train(model, loader, optimizer, weight, device='cpu'):
+def train(model, loader, optimizer, device='cpu'):
     model.train()
     total_loss = 0
     for data in loader:
@@ -32,7 +19,6 @@ def train(model, loader, optimizer, weight, device='cpu'):
         loss = torch.nn.functional.binary_cross_entropy_with_logits(
             out,
             data.y.type_as(out).view_as(out),
-            pos_weight= weight
         )
 
         loss.backward()
@@ -40,7 +26,7 @@ def train(model, loader, optimizer, weight, device='cpu'):
         total_loss += loss.item()
     return total_loss / len(loader)
 
-def test(model, loader, device='cpu'):
+def test(model, loader, classifier=None, device='cpu'):
     model.eval()
     preds = []
     probs = []
@@ -50,9 +36,11 @@ def test(model, loader, device='cpu'):
         for data in loader:
             data = data.to(device)
             try:
-                out = model.ft(data)  # logits shape: [batch_size]
-            except:
                 out = model(data)
+            except:
+                out = model(data.x, data.edge_index)
+            if classifier:
+                out = classifier(out[1], data.batch)
 
             prob = torch.sigmoid(out)  # No squeeze
             pred = (prob >= 0.5).long()
@@ -62,12 +50,10 @@ def test(model, loader, device='cpu'):
             truths.append(data.y.cpu())
 
     preds = torch.cat(preds)
-    probs = torch.cat(probs)
     truths = torch.cat(truths)
 
     acc = accuracy_score(truths, preds)
     f1 = f1_score(truths, preds)
-    auc = roc_auc_score(truths, probs)
 
     tn, fp, fn, tp = confusion_matrix(truths, preds).ravel()
     sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0.0
@@ -78,7 +64,6 @@ def test(model, loader, device='cpu'):
         "sensitivity": sensitivity,
         "specificity": specificity,
         "f1": f1,
-        "roc_auc": auc
     }
 
 def print_summary_table(all_metrics):
@@ -128,4 +113,76 @@ def compare_models(metrics_a, metrics_b, label_a="Model A", label_b="Model B"):
               f"{mean_b:>15.4f}{std_b:>12.4f}"
               f"{pct_inc:>15.2f}{p_val:>12.4f}")
 
+def update_target_encoder(student, teacher, alpha):
+    for t_param, s_param in zip(teacher.parameters(), student.parameters()):
+        t_param.data = alpha * t_param.data + (1 - alpha) * s_param.data
 
+def augment_fn(x, a, soft_mask_range=0.1, noise_std=0.01, drop_edge_prob=0.1):
+    u = torch.empty_like(x).uniform_(1 - soft_mask_range, 1 + soft_mask_range)
+    x_aug = x * u
+
+    if noise_std > 0:
+        noise = torch.randn_like(x) * noise_std
+        x_aug += noise
+
+    a_aug, _ = dropout_edge(a, drop_edge_prob)
+
+    return x_aug, a_aug
+
+def pretrain_bgrl(student, teacher, projector, optimizer, unlabeled_loader, alpha=0.99, lambda_rec=0.1, device='cuda'):
+    student.train()
+    projector.train()
+    total_loss = 0.0
+
+    for data_u in unlabeled_loader:
+        data_u = data_u.to(device)
+        x_u, ei_u = data_u.x, data_u.edge_index
+
+        x1, ei1 = augment_fn(x_u, ei_u)
+        x2, ei2 = augment_fn(x_u, ei_u)
+        x1, x2 = x1.to(device), x2.to(device)
+        ei1, ei2 = ei1.to(device), ei2.to(device)
+
+        x_hat1, z1 = student(x1, ei1)
+        p1 = projector(z1)
+
+        with torch.no_grad():
+            _, z2 = teacher(x2, ei2)
+
+        loss_contrastive = torch.nn.functional.mse_loss(p1, z2.detach())
+
+        loss_reconstruction = torch.nn.functional.mse_loss(x_hat1, x1)
+
+        loss = loss_contrastive + lambda_rec * loss_reconstruction
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        update_target_encoder(student, teacher, alpha)
+
+        total_loss += loss.item()
+
+    return total_loss
+
+def finetune_classifier(encoder, classifier, labeled_loader, optimizer, device='cuda'):
+    encoder.train()
+    classifier.train()
+    total_loss = 0.0
+    for data in labeled_loader:
+        data = data.to(device)
+        optimizer.zero_grad()
+        x, edge_index, batch, y = data.x, data.edge_index, data.batch, data.y
+
+        _, features = encoder(x, edge_index)
+
+        logits = classifier(features, batch)
+
+        loss = torch.nn.functional.binary_cross_entropy_with_logits(
+            logits, y.type_as(logits).view_as(logits)
+        )
+
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+    return total_loss / len(labeled_loader)

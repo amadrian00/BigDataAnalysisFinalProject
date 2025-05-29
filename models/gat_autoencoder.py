@@ -3,90 +3,51 @@
 
 import torch
 import torch.nn as nn
+from .projector import Classifier
 from torch_geometric.nn import GATConv
-
-from torch_geometric.nn import global_mean_pool
 
 class GATEncoder(nn.Module):
     def __init__(self, in_channels, hidden_channels, heads=1):
         super(GATEncoder, self).__init__()
         self.conv1 = GATConv(in_channels, hidden_channels, heads=heads)
-        self.conv2 = GATConv(hidden_channels*heads, int(hidden_channels/2), heads=1)
-        self.conv3 = GATConv(int(hidden_channels/2), in_channels, heads=heads)
+        self.conv2 = GATConv(hidden_channels*heads, hidden_channels, heads=1)
 
-        self.bn1 = nn.BatchNorm1d(num_features=hidden_channels)
-        self.bn2 = nn.BatchNorm1d(num_features=int(hidden_channels/2))
+        self.bn = nn.LayerNorm(hidden_channels)
 
         self.activation = nn.LeakyReLU()
 
+        self.in_channels = in_channels
         self.hidden_channels = hidden_channels
 
     def forward(self, x, edge_index):
         x = self.conv1(x, edge_index)
-        x = self.bn1(x)
+        x = self.bn(x)
         x = self.activation(x)
 
         x = self.conv2(x, edge_index)
-        x = self.bn2(x)
-        z = self.activation(x)
-
-        x = self.conv3(z, edge_index)
         return x
 
 class GATAnomalyDetector(nn.Module):
     def __init__(self, encoder):
         super(GATAnomalyDetector, self).__init__()
         self.encoder = encoder
-
-        self.activation = nn.LeakyReLU()
-        self.dropout = nn.Dropout(0.4)
-        self.lin = nn.Linear(int(encoder.hidden_channels/2), 1)
+        self.decoder = torch.nn.Linear(self.encoder.hidden_channels, self.encoder.in_channels)
 
     def forward(self, x, edge_index):
-        x_hat = self.encoder(x, edge_index)
-        loss = nn.functional.mse_loss(x_hat, x)
-        return x_hat, loss
-
-    def ft(self, data):
-        x = data.x
-        edge_index = data.edge_index
-        batch = data.batch
-
-        x = self.encoder.conv1(x, edge_index)
-        x = self.encoder.bn1(x)
-        x = self.encoder.activation(x)
-
-        x = self.encoder.conv2(x, edge_index)
-        x = self.encoder.bn2(x)
-        x = self.encoder.activation(x)
-
-        x = global_mean_pool(x, batch)
-
-        x = self.dropout(x)
-        return self.lin(x)
+        z = self.encoder(x, edge_index)
+        return torch.nn.functional.tanh(self.decoder(z)), z
 
 class GATEncoder2(nn.Module):
     def __init__(self, in_channels, hidden_channels, heads=1):
         super(GATEncoder2, self).__init__()
-        self.conv1 = GATConv(in_channels, hidden_channels, heads=heads)
-        self.conv2 = GATConv(hidden_channels * heads, hidden_channels, heads=1)
+        self.encoder = GATEncoder(in_channels, hidden_channels, heads=heads)
 
-        self.bn = nn.BatchNorm1d(num_features=hidden_channels)
-        self.activation = nn.LeakyReLU()
-        self.dropout = nn.Dropout(0.4)
-
-        self.lin = nn.Linear(hidden_channels, 1)
+        self.lin = Classifier(hidden_channels)
 
     def forward(self, data):
         x = data.x
         edge_index = data.edge_index
         batch = data.batch
 
-        x = self.conv1(x, edge_index)
-        x = self.bn(x)
-        x = self.activation(x)
-
-        x = self.conv2(x, edge_index)
-        x = global_mean_pool(x, batch)
-        x = self.dropout(x)
-        return self.lin(x)
+        x = self.encoder(x, edge_index)
+        return self.lin(x, batch)
