@@ -1,7 +1,7 @@
 import torch
 import numpy as np
 from scipy.stats import ttest_rel, tstd
-from torch_geometric.utils.dropout import dropout_edge
+from torch_geometric.nn import global_mean_pool
 from sklearn.metrics import accuracy_score, f1_score, confusion_matrix
 
 def train(model, loader, optimizer, device='cpu'):
@@ -11,15 +11,9 @@ def train(model, loader, optimizer, device='cpu'):
         data = data.to(device)
         optimizer.zero_grad()
 
-        try:
-            out = model.ft(data)  # logits shape: [batch_size]
-        except:
-            out = model(data)
+        out = model(data.x, data.edge_index)
 
-        loss = torch.nn.functional.binary_cross_entropy_with_logits(
-            out,
-            data.y.type_as(out).view_as(out),
-        )
+        loss = torch.nn.functional.mse_loss(out[0], data.x.type_as(out[0],).view_as(out[0],))
 
         loss.backward()
         optimizer.step()
@@ -29,24 +23,19 @@ def train(model, loader, optimizer, device='cpu'):
 def test(model, loader, classifier=None, device='cpu'):
     model.eval()
     preds = []
-    probs = []
     truths = []
 
     with torch.no_grad():
         for data in loader:
             data = data.to(device)
-            try:
-                out = model(data)
-            except:
-                out = model(data.x, data.edge_index)
-            if classifier:
-                out = classifier(out[1], data.batch)
 
-            prob = torch.sigmoid(out)  # No squeeze
-            pred = (prob >= 0.5).long()
+            out = model(data.x, data.edge_index)
 
-            preds.append(pred.cpu())
-            probs.append(prob.cpu())
+            z = global_mean_pool(out[1], data.batch)
+
+            pred = torch.tensor(classifier.predict(z.cpu()))
+
+            preds.append(pred)
             truths.append(data.y.cpu())
 
     preds = torch.cat(preds)
@@ -113,76 +102,70 @@ def compare_models(metrics_a, metrics_b, label_a="Model A", label_b="Model B"):
               f"{mean_b:>15.4f}{std_b:>12.4f}"
               f"{pct_inc:>15.2f}{p_val:>12.4f}")
 
-def update_target_encoder(student, teacher, alpha):
-    for t_param, s_param in zip(teacher.parameters(), student.parameters()):
-        t_param.data = alpha * t_param.data + (1 - alpha) * s_param.data
+def graph_augment_fmri(x, e, noise_std=0.25, drop_prob=0.25):
+    x_aug = x.clone()
 
-def augment_fn(x, a, soft_mask_range=0.1, noise_std=0.01, drop_edge_prob=0.1):
-    u = torch.empty_like(x).uniform_(1 - soft_mask_range, 1 + soft_mask_range)
-    x_aug = x * u
+    noise = torch.randn_like(x_aug) * noise_std
+    x_aug = x_aug + noise
+    x_aug = torch.nn.functional.dropout(x_aug, drop_prob)
 
-    if noise_std > 0:
-        noise = torch.randn_like(x) * noise_std
-        x_aug += noise
+    return x_aug, e
 
-    a_aug, _ = dropout_edge(a, drop_edge_prob)
+def negative_cosine_similarity(p, z):
+    p = torch.nn.functional.normalize(p, dim=-1)
+    z = torch.nn.functional.normalize(z.detach(), dim=-1)
+    return - (p * z).sum(dim=-1).mean()
 
-    return x_aug, a_aug
+def simsiam_loss(p1, z2, p2, z1):
+    return (negative_cosine_similarity(p1, z2) + negative_cosine_similarity(p2, z1)) / 2
 
-def pretrain_bgrl(student, teacher, projector, optimizer, unlabeled_loader, alpha=0.99, lambda_rec=0.1, device='cuda'):
-    student.train()
-    projector.train()
-    total_loss = 0.0
+def contrastive_train(model, loader, optimizer, device='cpu'):
+    model.train()
+    total_loss = 0
 
-    for data_u in unlabeled_loader:
-        data_u = data_u.to(device)
-        x_u, ei_u = data_u.x, data_u.edge_index
-
-        x1, ei1 = augment_fn(x_u, ei_u)
-        x2, ei2 = augment_fn(x_u, ei_u)
-        x1, x2 = x1.to(device), x2.to(device)
-        ei1, ei2 = ei1.to(device), ei2.to(device)
-
-        x_hat1, z1 = student(x1, ei1)
-        p1 = projector(z1)
-
-        with torch.no_grad():
-            _, z2 = teacher(x2, ei2)
-
-        loss_contrastive = torch.nn.functional.mse_loss(p1, z2.detach())
-
-        loss_reconstruction = torch.nn.functional.mse_loss(x_hat1, x1)
-
-        loss = loss_contrastive + lambda_rec * loss_reconstruction
-
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-
-        update_target_encoder(student, teacher, alpha)
-
-        total_loss += loss.item()
-
-    return total_loss
-
-def finetune_classifier(encoder, classifier, labeled_loader, optimizer, device='cuda'):
-    encoder.train()
-    classifier.train()
-    total_loss = 0.0
-    for data in labeled_loader:
+    for data in loader:
         data = data.to(device)
+        x = data.x
+        e = data.edge_index
+
+        # Aumentaciones
+        x1, e1 = graph_augment_fmri(x, e)
+        x2, e2 = graph_augment_fmri(x, e)
+        x1, x2, e1, e2 = x1.to(device), x2.to(device), e1.to(device), e2.to(device)
+
+        # Forward
+        _, h1, p1 = model(x1, e1)
+        _, h2, p2 = model(x2, e2)
+
+        # Para batch training, reordena en [batch, feature]
+        B = h1.shape[0] // 200
+        h1 = h1.view(B, -1)
+        h2 = h2.view(B, -1)
+        p1 = p1.view(B, -1)
+        p2 = p2.view(B, -1)
+
+        # SimSiam loss
+        loss = simsiam_loss(p1, h2, p2, h1)
+
         optimizer.zero_grad()
-        x, edge_index, batch, y = data.x, data.edge_index, data.batch, data.y
-
-        _, features = encoder(x, edge_index)
-
-        logits = classifier(features, batch)
-
-        loss = torch.nn.functional.binary_cross_entropy_with_logits(
-            logits, y.type_as(logits).view_as(logits)
-        )
-
         loss.backward()
         optimizer.step()
+
         total_loss += loss.item()
-    return total_loss / len(labeled_loader)
+
+    return total_loss / len(loader)
+
+def extract_embeddings(encoder, loader, device='cpu'):
+    encoder.eval()
+    all_embeddings = []
+    all_labels = []
+    for data in loader:
+        data = data.to(device)
+        with torch.no_grad():
+            _, z, _ = encoder(data.x, data.edge_index)
+        pooled = global_mean_pool(z, data.batch)
+        all_embeddings.append(pooled.cpu())
+        all_labels.append(data.y.cpu())
+    X = torch.cat(all_embeddings).numpy()
+    y = torch.cat(all_labels).numpy()
+    return X, y

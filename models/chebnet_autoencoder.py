@@ -3,21 +3,39 @@
 
 import torch
 import torch.nn as nn
-from .projector import Classifier
+from .projector import Projector
 from torch_geometric.nn import ChebConv
 
 class ChebEncoder(nn.Module):
-    def __init__(self, in_channels, hidden_channels, k=2):
+    def __init__(self, in_channels, hidden_channels, K=2):
         super(ChebEncoder, self).__init__()
+        self.conv1 = ChebConv(in_channels, hidden_channels, K=K)
+        self.conv2 = ChebConv(hidden_channels, in_channels, K=K)
+
+        self.projector = Projector(hidden_channels)
+
+    def forward(self, x, edge_index):
+        z = self.conv1(x, edge_index)
+        x = torch.relu(z)
+        return self.conv2(x, edge_index), z, self.projector(z)
+
+class ChebAnomalyDetector(nn.Module):
+    def __init__(self, in_channels, hidden_channels, K=2):
+        super(ChebAnomalyDetector, self).__init__()
+        self.encoder = ChebEncoder(in_channels, hidden_channels, K=K)
+
+    def forward(self, x, edge_index):
+        return self.encoder(x, edge_index)
+
+class ChebEncoderP(nn.Module):
+    def __init__(self, in_channels, hidden_channels, k=2):
+        super(ChebEncoderP, self).__init__()
         self.conv1 = ChebConv(in_channels, hidden_channels, K=k)
         self.conv2 = ChebConv(hidden_channels, hidden_channels, K=k)
 
         self.bn = nn.LayerNorm(hidden_channels)
 
         self.activation = nn.LeakyReLU()
-
-        self.in_channels = in_channels
-        self.hidden_channels = hidden_channels
 
     def forward(self, x, edge_index):
         x = self.conv1(x, edge_index)
@@ -27,27 +45,13 @@ class ChebEncoder(nn.Module):
         x = self.conv2(x, edge_index)
         return x
 
-class ChebAnomalyDetector(nn.Module):
-    def __init__(self, encoder):
-        super(ChebAnomalyDetector, self).__init__()
-        self.encoder = encoder
-        self.decoder = torch.nn.Linear(self.encoder.hidden_channels, self.encoder.in_channels)
+class ChebAnomalyDetectorP(nn.Module):
+    def __init__(self, in_channels, hidden_channels, k=2):
+        super(ChebAnomalyDetectorP, self).__init__()
+        self.encoder = ChebEncoderP(in_channels, hidden_channels, k=k)
+        self.decoder = torch.nn.Linear(hidden_channels, in_channels)
+        self.projector = Projector(hidden_channels)
 
     def forward(self, x, edge_index):
         z = self.encoder(x, edge_index)
-        return torch.nn.functional.tanh(self.decoder(z)), z
-
-class ChebEncoder2(nn.Module):
-    def __init__(self, in_channels, hidden_channels, k=2):
-        super(ChebEncoder2, self).__init__()
-        self.encoder = ChebEncoder(in_channels, hidden_channels, k)
-
-        self.lin = Classifier(hidden_channels)
-
-    def forward(self, data):
-        x = data.x
-        edge_index = data.edge_index
-        batch = data.batch
-
-        x = self.encoder(x, edge_index)
-        return self.lin(x, batch)
+        return torch.nn.functional.tanh(self.decoder(z)), z, self.projector(z)
