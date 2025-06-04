@@ -129,23 +129,19 @@ def contrastive_train(model, loader, optimizer, device='cpu'):
         x = data.x
         e = data.edge_index
 
-        # Aumentaciones
         x1, e1 = graph_augment_fmri(x, e)
         x2, e2 = graph_augment_fmri(x, e)
         x1, x2, e1, e2 = x1.to(device), x2.to(device), e1.to(device), e2.to(device)
 
-        # Forward
         _, h1, p1 = model(x1, e1)
         _, h2, p2 = model(x2, e2)
 
-        # Para batch training, reordena en [batch, feature]
         B = h1.shape[0] // 200
         h1 = h1.view(B, -1)
         h2 = h2.view(B, -1)
         p1 = p1.view(B, -1)
         p2 = p2.view(B, -1)
 
-        # SimSiam loss
         loss = simsiam_loss(p1, h2, p2, h1)
 
         optimizer.zero_grad()

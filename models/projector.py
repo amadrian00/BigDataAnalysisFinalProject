@@ -1,5 +1,4 @@
 import torch.nn as nn
-from torch_geometric.nn import global_mean_pool
 
 class Projector(nn.Module):
     def __init__(self, input_dim):
