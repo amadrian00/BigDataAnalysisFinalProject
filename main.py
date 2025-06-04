@@ -53,7 +53,7 @@ seeds = [21, 42, 63, 84, 105]
 
 input_dim = graphs[0].x.shape[1]
 hidden_dim = 128
-epochs = 10
+epochs = 25
 
 batch_size = 64
 

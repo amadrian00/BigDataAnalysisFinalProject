@@ -1,6 +1,7 @@
 import torch
 import numpy as np
 from scipy.stats import ttest_rel, tstd
+from torch_geometric.utils import dropout_edge
 from torch_geometric.nn import global_mean_pool
 from sklearn.metrics import accuracy_score, f1_score, confusion_matrix
 
